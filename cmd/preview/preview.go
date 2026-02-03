@@ -39,9 +39,15 @@ var PreviewCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		start := time.Now()
 
-		if configErr := utils.ViperInit(); configErr != nil {
-			render.GetLogger(log.Options{Prefix: "Sidekick Config"}).Fatalf("%s", configErr)
+		config, err := utils.GetSidekickConfigFromCmdContext(cmd)
+		if err != nil {
+			render.GetLogger(log.Options{Prefix: "Sidekick Config"}).Fatalf("%s", err)
 		}
+		sidekickServer, err := config.FindServerByContext(config.CurrentContext)
+		if err != nil {
+			render.GetLogger(log.Options{Prefix: "Sidekick Config"}).Fatalf("%s", err)
+		}
+
 		appConfig, appConfigErr := utils.LoadAppConfig()
 		if appConfigErr != nil {
 			render.GetLogger(log.Options{Prefix: "Sidekick Setup"}).Error("Sidekick config exits in this project.")
@@ -49,7 +55,7 @@ var PreviewCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		if viper.GetString("secretKey") == "" {
+		if sidekickServer.SecretKey == "" {
 			render.GetLogger(log.Options{Prefix: "Backward Compat"}).Error("Recent changes to how Sidekick handles secrets prevents you from launcing a new application.")
 			render.GetLogger(log.Options{Prefix: "Backward Compat"}).Info("To fix this, run `Sidekick init` with the same server address you have now.")
 			render.GetLogger(log.Options{Prefix: "Backward Compat"}).Info("Learn more at www.sidekickdeploy.com/docs/design/encryption")
@@ -98,7 +104,7 @@ var PreviewCmd = &cobra.Command{
 			dockerEnvProperty := []string{}
 			envFileChecksum := ""
 			if appConfig.Env.File != "" {
-				envErr := utils.HandleEnvFile(appConfig.Env.File, &dockerEnvProperty, &envFileChecksum)
+				envErr := utils.HandleEnvFile(appConfig.Env.File, &dockerEnvProperty, &envFileChecksum, sidekickServer.PublicKey)
 				if envErr != nil {
 					panic(envErr)
 				}

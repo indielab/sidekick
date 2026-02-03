@@ -12,10 +12,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-package cmd
+package initialize
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -24,6 +23,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/docker/docker/pkg/namesgenerator"
 	"github.com/mightymoud/sidekick/render"
 	"github.com/mightymoud/sidekick/utils"
 	"github.com/spf13/cobra"
@@ -78,30 +78,27 @@ func stage3UserSetup(client *ssh.Client, loggedInUser string) error {
 	return nil
 }
 
-func stage4VPSSetup(client *ssh.Client, p *tea.Program) error {
+func stage4VPSSetup(client *ssh.Client, p *tea.Program, server *utils.SidekickServer) error {
 	// get the linux distro
 	outChan, _, _ := utils.RunCommand(client, "grep '^ID=' /etc/os-release | awk -F'=' '{print $2}'")
 	linuxDistro := <-outChan
-	viper.Set("distro", linuxDistro)
+	server.Distro = linuxDistro
 
 	// get docker platform id
 	cmdOutChan, _, _ := utils.RunCommand(client, "uname -m")
 	arch := <-cmdOutChan
 	if arch == "x86_64" {
-		viper.Set("platformID", "linux/amd64")
+		server.PlatformId = "linux/amd64"
 	}
 	if arch == "aarch64" {
-		viper.Set("platformID", "linux/arm64")
+		server.PlatformId = "linux/arm64"
 	}
 
 	if err := utils.RunCommandsWithTUIHook(client, utils.SetupStage.Commands, p); err != nil {
 		return err
 	}
 
-	publicKey := viper.GetString("publicKey")
-	secretKey := viper.GetString("secretKey")
-
-	if publicKey == "" || secretKey == "" {
+	if server.PublicKey == "" || server.SecretKey == "" {
 		cmd := exec.Command("age-keygen")
 		output, err := cmd.Output()
 		if err != nil {
@@ -110,14 +107,12 @@ func stage4VPSSetup(client *ssh.Client, p *tea.Program) error {
 		outStr := string(output)
 		lines := strings.Split(outStr, "\n")
 		if len(lines) >= 3 {
-			secretKey = lines[2]
+			server.SecretKey = lines[2]
 			parts := strings.Split(lines[1], ":")
 			if len(parts) > 1 {
-				publicKey = strings.ReplaceAll(parts[1], " ", "")
+				server.PublicKey = strings.ReplaceAll(parts[1], " ", "")
 			}
 		}
-		viper.Set("publicKey", publicKey)
-		viper.Set("secretKey", secretKey)
 	}
 	return nil
 }
@@ -168,17 +163,20 @@ var InitCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		start := time.Now()
 
-		if configErr := utils.ViperInit(); configErr != nil {
-			if errors.As(configErr, &viper.ConfigFileNotFoundError{}) {
-				initConfig()
-			} else {
-				log.Fatalf("%s", configErr)
-			}
+		config, err := utils.GetSidekickConfigFromCmdContext(cmd)
+		if err != nil {
+			log.Fatalf("%s", err)
 		}
 
 		skipPromptsFlag, _ := cmd.Flags().GetBool("yes")
 		server, _ := cmd.Flags().GetString("server")
 		certEmail, _ := cmd.Flags().GetString("email")
+		name, _ := cmd.Flags().GetString("name")
+
+		if name == "" {
+			randomName := namesgenerator.GetRandomName(0)
+			name = render.GenerateTextQuestion("Please enter a name for your VPS", randomName, "")
+		}
 
 		if server == "" {
 			server = render.GenerateTextQuestion("Please enter the IPv4 Address of your VPS", "", "")
@@ -194,17 +192,25 @@ var InitCmd = &cobra.Command{
 			}
 		}
 
-		publicKey := viper.GetString("publicKey")
-		if publicKey != "" && server != viper.GetString("serverAddress") && !skipPromptsFlag {
-			confirm := render.GenerateTextQuestion("A server was previously setup with Sidekick. Would you like to override the settings? (y/n)", "n", "")
+		sidekickServer, err := config.FindServer(name)
+		if err != nil {
+			sidekickServer = utils.SidekickServer{
+				Name:      name,
+				Address:   server,
+				CertEmail: certEmail,
+			}
+		}
+
+		if sidekickServer.Name == name && sidekickServer.Address != server && sidekickServer.PublicKey != "" && !skipPromptsFlag {
+			confirm := render.GenerateTextQuestion(fmt.Sprintf("The server '%s' was previously setup with Sidekick using a different address. Would you like to overwrite the settings? (y/n)", sidekickServer.Name), "n", "")
 			if strings.ToLower(confirm) != "y" {
-				fmt.Println("\nCurrently Sidekick only supports one server per setup")
+				fmt.Println("\nYou can use a different server name to complete the setup")
 				os.Exit(0)
 			}
 		}
 
-		viper.Set("serverAddress", server)
-		viper.Set("certEmail", certEmail)
+		sidekickServer.Address = server
+		sidekickServer.CertEmail = certEmail
 
 		cmdStages := []render.Stage{
 			render.MakeStage("Setting up your local env", "Installed local requirements successfully", false),
@@ -254,7 +260,7 @@ var InitCmd = &cobra.Command{
 			time.Sleep(time.Millisecond * 100)
 			p.Send(render.NextStageMsg{})
 
-			if err := stage4VPSSetup(sidekickClient, p); err != nil {
+			if err := stage4VPSSetup(sidekickClient, p, &sidekickServer); err != nil {
 				p.Send(render.ErrorMsg{ErrorStr: fmt.Sprintf("VPS setup failed: %s", err)})
 				return
 			}
@@ -273,7 +279,12 @@ var InitCmd = &cobra.Command{
 				return
 			}
 
-			if err := viper.WriteConfig(); err != nil {
+			config.AddOrReplaceServer(sidekickServer)
+			newContext := utils.SidekickContext{Name: sidekickServer.Name, Server: sidekickServer.Name}
+			config.AddOrReplaceContext(newContext)
+			config.CurrentContext = newContext.Name
+
+			if err := config.Save(viper.GetString("config")); err != nil {
 				p.Send(render.ErrorMsg{ErrorStr: fmt.Sprintf("Failed to write config: %s", err)})
 				return
 			}
@@ -288,35 +299,9 @@ var InitCmd = &cobra.Command{
 	},
 }
 
-func initConfig() {
-	home, err := os.UserHomeDir()
-	cobra.CheckErr(err)
-
-	configPath := fmt.Sprintf("%s/.config/sidekick", home)
-	configFile := fmt.Sprintf("%s/default.yaml", configPath)
-
-	makeDirErr := os.MkdirAll(configPath, os.ModePerm)
-	if makeDirErr != nil {
-		log.Fatalf("Error creating directory: %v\n", makeDirErr)
-		os.Exit(1)
-	}
-
-	viper.AddConfigPath(configPath)
-	viper.SetConfigType("yaml")
-	viper.SetConfigName("default")
-	file, fileCreateErr := os.Create(configFile)
-	if fileCreateErr != nil {
-		log.Fatalf("Error creating configFile: %v\n", fileCreateErr)
-		os.Exit(1)
-	}
-
-	file.Close()
-}
-
 func init() {
-	rootCmd.AddCommand(InitCmd)
-
 	InitCmd.Flags().StringP("server", "s", "", "Set the IP address of your Server")
 	InitCmd.Flags().StringP("email", "e", "", "An email address to be used for SSL certs")
+	InitCmd.Flags().StringP("name", "n", "", "Set the name of your Server")
 	InitCmd.Flags().BoolP("yes", "y", false, "Skip all validation prompts")
 }

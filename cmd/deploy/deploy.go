@@ -17,36 +17,28 @@ package deploy
 import (
 	"crypto/md5"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/log"
 	teaLog "github.com/charmbracelet/log"
 	"github.com/mightymoud/sidekick/render"
 	"github.com/mightymoud/sidekick/utils"
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
 )
 
-func prelude() utils.SidekickAppConfig {
-	if configErr := utils.ViperInit(); configErr != nil {
-		pterm.Error.Println("Sidekick config not found - Run sidekick init")
-		os.Exit(1)
-	}
+func prelude(config *utils.SidekickConfig) (utils.SidekickAppConfig, utils.SidekickServer) {
 	if !utils.FileExists("./sidekick.yml") {
 		pterm.Error.Println(`Sidekick config not found in current directory Run sidekick launch`)
-		os.Exit(1)
-	}
-	if viper.GetString("secretKey") == "" {
-		render.GetLogger(teaLog.Options{Prefix: "Backward Compat"}).Error("Recent changes to how Sidekick handles secrets prevents you from launcing a new application.")
-		render.GetLogger(teaLog.Options{Prefix: "Backward Compat"}).Info("To fix this, run `Sidekick init` with the same server address you have now.")
-		render.GetLogger(teaLog.Options{Prefix: "Backward Compat"}).Info("Learn more at www.sidekickdeploy.com/docs/design/encryption")
 		os.Exit(1)
 	}
 
@@ -54,15 +46,51 @@ func prelude() utils.SidekickAppConfig {
 	if loadError != nil {
 		panic(loadError)
 	}
-	return appConfig
+
+	// Older version of app config does not have server name
+	// We will try to match the first server with IP matching the url
+	if appConfig.Server == "" {
+		render.GetLogger(teaLog.Options{Prefix: "Backward Compat"}).Info("An older version of sidekick.yml is found. Attempting to match a server from url...")
+		ips, err := net.LookupIP(appConfig.Url)
+		if err != nil {
+			render.GetLogger(teaLog.Options{Prefix: "Backward Compat"}).Fatal(err)
+		}
+		for _, server := range config.Servers {
+			if slices.ContainsFunc(ips, func(ip net.IP) bool {
+				return ip.String() == server.Address
+			}) {
+				appConfig.Server = server.Name
+				render.GetLogger(teaLog.Options{Prefix: "Backward Compat"}).Info("Found server", "name", server.Name, "IP", server.Address)
+				break
+			}
+		}
+	}
+
+	if appConfig.Server == "" {
+		render.GetLogger(teaLog.Options{Prefix: "Backward Compat"}).Fatal("Unable to find a server that this app was deployed.")
+	}
+
+	server, err := config.FindServer(appConfig.Server)
+	if err != nil {
+		render.GetLogger(teaLog.Options{Prefix: "Sidekick Config"}).Fatal(err)
+	}
+
+	if server.SecretKey == "" {
+		render.GetLogger(teaLog.Options{Prefix: "Backward Compat"}).Error("Recent changes to how Sidekick handles secrets prevents you from launcing a new application.")
+		render.GetLogger(teaLog.Options{Prefix: "Backward Compat"}).Info("To fix this, run `Sidekick init` with the same server address you have now.")
+		render.GetLogger(teaLog.Options{Prefix: "Backward Compat"}).Info("Learn more at www.sidekickdeploy.com/docs/design/encryption")
+		os.Exit(1)
+	}
+
+	return appConfig, server
 }
 
-func stage1Login() (*ssh.Client, error) {
-	sshClient, err := utils.Login(viper.GetString("serverAddress"), "sidekick")
+func stage1Login(server *utils.SidekickServer) (*ssh.Client, error) {
+	sshClient, err := utils.Login(server.Address, "sidekick")
 	return sshClient, err
 }
 
-func stage2EnvFile(appConfig utils.SidekickAppConfig, p *tea.Program) (bool, string, error) {
+func stage2EnvFile(appConfig utils.SidekickAppConfig, p *tea.Program, server *utils.SidekickServer) (bool, string, error) {
 	defer os.Remove("encrypted.env")
 	envFileChanged := false
 	currentEnvFileHash := ""
@@ -75,14 +103,14 @@ func stage2EnvFile(appConfig utils.SidekickAppConfig, p *tea.Program) (bool, str
 		envFileChanged = appConfig.Env.Hash != currentEnvFileHash
 		if envFileChanged {
 			// encrypt new env file
-			envCmd := exec.Command("sh", "-s", "-", viper.GetString("publicKey"), fmt.Sprintf("./%s", appConfig.Env.File))
+			envCmd := exec.Command("sh", "-s", "-", server.PublicKey, fmt.Sprintf("./%s", appConfig.Env.File))
 			envCmd.Stdin = strings.NewReader(utils.EnvEncryptionScript)
 			envCmdErrPipe, _ := envCmd.StderrPipe()
 			go render.SendLogsToTUI(envCmdErrPipe, p)
 			if envCmdErr := envCmd.Run(); envCmdErr != nil {
 				return false, "", fmt.Errorf("failed to encrypt environment file: %w", envCmdErr)
 			}
-			encryptSyncCmd := exec.Command("rsync", "-v", "encrypted.env", fmt.Sprintf("%s@%s:%s", "sidekick", viper.Get("serverAddress").(string), fmt.Sprintf("./%s", appConfig.Name)))
+			encryptSyncCmd := exec.Command("rsync", "-v", "encrypted.env", fmt.Sprintf("%s@%s:%s", "sidekick", server.Address, fmt.Sprintf("./%s", appConfig.Name)))
 			encryptSyncCmdErrPipe, _ := encryptSyncCmd.StderrPipe()
 			go render.SendLogsToTUI(encryptSyncCmdErrPipe, p)
 			if encryptSyncCmdErr := encryptSyncCmd.Run(); encryptSyncCmdErr != nil {
@@ -93,9 +121,9 @@ func stage2EnvFile(appConfig utils.SidekickAppConfig, p *tea.Program) (bool, str
 	return envFileChanged, currentEnvFileHash, nil
 }
 
-func stage3BuildDockerImage(appConfig utils.SidekickAppConfig, p *tea.Program) error {
+func stage3BuildDockerImage(appConfig utils.SidekickAppConfig, p *tea.Program, server *utils.SidekickServer) error {
 	cwd, _ := os.Getwd()
-	dockerPlatformId := viper.GetString("platformID")
+	dockerPlatformId := server.PlatformId
 	dockerBuildCmd := exec.Command("docker", "build", "--tag", appConfig.Name, "--progress=plain", fmt.Sprintf("--platform=%s", dockerPlatformId), cwd)
 	dockerBuildCmdErrPipe, _ := dockerBuildCmd.StderrPipe()
 	go render.SendLogsToTUI(dockerBuildCmdErrPipe, p)
@@ -118,9 +146,9 @@ func stage4SaveDockerImage(appConfig utils.SidekickAppConfig, p *tea.Program) er
 	return nil
 }
 
-func stage5MoveDockerImage(appConfig utils.SidekickAppConfig, p *tea.Program) error {
+func stage5MoveDockerImage(appConfig utils.SidekickAppConfig, p *tea.Program, server *utils.SidekickServer) error {
 	imgFileName := fmt.Sprintf("%s-latest.tar", appConfig.Name)
-	remoteDist := fmt.Sprintf("%s@%s:./%s", "sidekick", viper.GetString("serverAddress"), appConfig.Name)
+	remoteDist := fmt.Sprintf("%s@%s:./%s", "sidekick", server.Address, appConfig.Name)
 	imgMoveCmd := exec.Command("scp", "-C", imgFileName, remoteDist)
 	imgMoveCmdErrorPipe, _ := imgMoveCmd.StderrPipe()
 	go render.SendLogsToTUI(imgMoveCmdErrorPipe, p)
@@ -132,7 +160,7 @@ func stage5MoveDockerImage(appConfig utils.SidekickAppConfig, p *tea.Program) er
 	return nil
 }
 
-func stage6Deploy(sshClient *ssh.Client, appConfig utils.SidekickAppConfig, envFileChanged bool, currentEnvFileHash string, p *tea.Program) error {
+func stage6Deploy(sshClient *ssh.Client, appConfig utils.SidekickAppConfig, envFileChanged bool, currentEnvFileHash string, p *tea.Program, server *utils.SidekickServer) error {
 	dockerLoadOutChan, _, sessionErr := utils.RunCommand(sshClient, fmt.Sprintf("cd %s && docker load -i %s-latest.tar", appConfig.Name, appConfig.Name))
 	if sessionErr != nil {
 		return fmt.Errorf("failed to load docker image on server: %w", sessionErr)
@@ -150,7 +178,7 @@ func stage6Deploy(sshClient *ssh.Client, appConfig utils.SidekickAppConfig, envF
 	)
 
 	deployScript := replacer.Replace(utils.DeployAppScript)
-	utils.RunCommandWithTUIHook(sshClient, deployScript, p, utils.EnvVar{"SOPS_AGE_KEY": viper.GetString("secretKey")})
+	utils.RunCommandWithTUIHook(sshClient, deployScript, p, utils.EnvVar{"SOPS_AGE_KEY": server.SecretKey})
 	time.Sleep(time.Second * 2)
 
 	cleanOutChan, _, sessionErr := utils.RunCommand(sshClient, fmt.Sprintf("cd %s && rm %s", appConfig.Name, fmt.Sprintf("%s-latest.tar", appConfig.Name)))
@@ -178,12 +206,16 @@ func stage6Deploy(sshClient *ssh.Client, appConfig utils.SidekickAppConfig, envF
 var DeployCmd = &cobra.Command{
 	Use:   "deploy",
 	Short: "Deploy a new version of your application to your VPS using Sidekick",
-	Long: `This command deploys a new version of your application to your VPS. 
+	Long: `This command deploys a new version of your application to your VPS.
 It assumes that your VPS is already configured and that your application is ready for deployment`,
 	Run: func(cmd *cobra.Command, args []string) {
 		start := time.Now()
 
-		appConfig := prelude()
+		config, err := utils.GetSidekickConfigFromCmdContext(cmd)
+		if err != nil {
+			render.GetLogger(log.Options{Prefix: "Sidekick Config"}).Fatalf("%s", err)
+		}
+		appConfig, sidekickServer := prelude(config)
 
 		cmdStages := []render.Stage{
 			render.MakeStage("Validating connection with VPS", "VPS is reachable", false),
@@ -195,28 +227,28 @@ It assumes that your VPS is already configured and that your application is read
 		}
 		p := tea.NewProgram(render.TuiModel{
 			Stages:      cmdStages,
-			BannerMsg:   "Deploying a new env of your app 😎",
+			BannerMsg:   fmt.Sprintf("Deploying a new env of your app to server %s (%s) 😎", sidekickServer.Name, sidekickServer.Address),
 			ActiveIndex: 0,
 			Quitting:    false,
 			AllDone:     false,
 		})
 
 		go func() {
-			sshClient, err := stage1Login()
+			sshClient, err := stage1Login(&sidekickServer)
 			if err != nil {
 				p.Send(render.ErrorMsg{ErrorStr: "Failed to connect to VPS: " + err.Error()})
 				return
 			}
 			p.Send(render.NextStageMsg{})
 
-			envFileChanged, currentEnvFileHash, err := stage2EnvFile(appConfig, p)
+			envFileChanged, currentEnvFileHash, err := stage2EnvFile(appConfig, p, &sidekickServer)
 			if err != nil {
 				p.Send(render.ErrorMsg{ErrorStr: err.Error()})
 				return
 			}
 			p.Send(render.NextStageMsg{})
 
-			if err := stage3BuildDockerImage(appConfig, p); err != nil {
+			if err := stage3BuildDockerImage(appConfig, p, &sidekickServer); err != nil {
 				p.Send(render.ErrorMsg{ErrorStr: err.Error()})
 				return
 			}
@@ -230,14 +262,14 @@ It assumes that your VPS is already configured and that your application is read
 			time.Sleep(time.Millisecond * 200)
 			p.Send(render.NextStageMsg{})
 
-			if err := stage5MoveDockerImage(appConfig, p); err != nil {
+			if err := stage5MoveDockerImage(appConfig, p, &sidekickServer); err != nil {
 				p.Send(render.ErrorMsg{ErrorStr: err.Error()})
 				return
 			}
 			time.Sleep(time.Millisecond * 200)
 			p.Send(render.NextStageMsg{})
 
-			if err := stage6Deploy(sshClient, appConfig, envFileChanged, currentEnvFileHash, p); err != nil {
+			if err := stage6Deploy(sshClient, appConfig, envFileChanged, currentEnvFileHash, p, &sidekickServer); err != nil {
 				p.Send(render.ErrorMsg{ErrorStr: err.Error()})
 				return
 			}

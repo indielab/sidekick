@@ -218,7 +218,7 @@ func LoadAppConfig() (SidekickAppConfig, error) {
 	return appConfigFile, nil
 }
 
-func HandleEnvFile(envFileName string, dockerEnvProperty *[]string, envFileChecksum *string) error {
+func HandleEnvFile(envFileName string, dockerEnvProperty *[]string, envFileChecksum *string, publicKey string) error {
 	envFile, envFileErr := os.Open(fmt.Sprintf("./%s", envFileName))
 	if envFileErr != nil {
 		return envFileErr
@@ -240,7 +240,7 @@ func HandleEnvFile(envFileName string, dockerEnvProperty *[]string, envFileCheck
 	envCmd := exec.Command("sops",
 		"encrypt",
 		"--output-type", "dotenv",
-		"--age", viper.GetString("publicKey"),
+		"--age", publicKey,
 		fmt.Sprintf("./%s", envFileName),
 	)
 	outfile, err := os.Create("encrypted.env")

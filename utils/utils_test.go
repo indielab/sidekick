@@ -8,7 +8,6 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/mightymoud/sidekick/utils"
-	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -31,9 +30,8 @@ func TestHandleEnvFile(t *testing.T) {
 	envFileContent, envMarshalErr := godotenv.Marshal(envMap)
 	assert.NoError(t, envMarshalErr)
 
-	viper.Set("publicKey", "age1lgjx644dkpj2nas84pfe4dsd96tph8yxhgf6zfh58kqw06qycavsz00rzm")
-
-	err = utils.HandleEnvFile(envFileName, &dockerEnvProperty, &envFileChecksum)
+	pub := "age1lgjx644dkpj2nas84pfe4dsd96tph8yxhgf6zfh58kqw06qycavsz00rzm"
+	err = utils.HandleEnvFile(envFileName, &dockerEnvProperty, &envFileChecksum, pub)
 	assert.NoError(t, err)
 
 	assert.Contains(t, dockerEnvProperty, "KEY2=${KEY2}")
